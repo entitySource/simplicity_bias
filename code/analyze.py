@@ -1,6 +1,6 @@
 """Summarise runs.jsonl into tables (results/summary.md, results/*.csv) and figures.
 
-Usage: python analyze.py [path/to/runs.jsonl]
+Usage: python analyze.py [runs.jsonl ...]   (default: results/runs.jsonl and results/runs_confirm.jsonl)
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 RES = os.path.join(HERE, "..", "results")
 FIG = os.path.join(HERE, "..", "figures")
-RNG = np.random.default_rng(0)
 COL = {2: "#7f7f7f", 3: "#1f77b4", 5: "#d62728"}
 
 
@@ -37,14 +36,15 @@ def ci95(x):
     x = np.asarray(x, float)
     if len(x) < 2:
         return float("nan")
-    return 2.776 * x.std(ddof=1) / math.sqrt(len(x)) if len(x) == 5 else 1.96 * x.std(ddof=1) / math.sqrt(len(x))
+    t = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571, 7: 2.447, 8: 2.365, 9: 2.306, 10: 2.262}.get(len(x), 1.96)
+    return t * x.std(ddof=1) / math.sqrt(len(x))
 
 
 def speed_table(runs):
     """One row per condition: isolated learning times, speed gap, joint preference."""
     g = collections.defaultdict(lambda: collections.defaultdict(list))
     for r in runs:
-        if r["exp"] in ("E1", "E3", "R1"):
+        if r["exp"] in ("E1", "E3", "R1", "C3"):
             g[cond_key(r)][r["mode"]].append(r)
     rows = []
     for k, modes in sorted(g.items()):
@@ -82,17 +82,30 @@ G_GRID = np.linspace(-5, 5, 1001)
 B_GRID = np.exp(np.linspace(np.log(0.2), np.log(20), 60))
 
 
+def _sse_grid(x, y, gs, bs):
+    z = bs[:, None, None] * (x[None, None, :] - gs[None, :, None])
+    return ((1 / (1 + np.exp(-z)) - y[None, None, :]) ** 2).sum(-1)
+
+
 def fit_sigmoid(x, y):
     """Least squares fit of y = sigmoid(b * (x - g)) by grid search (robust to
-    saturated points, unlike OLS on logits). Returns (g, b)."""
-    z = B_GRID[:, None, None] * (x[None, None, :] - G_GRID[None, :, None])
-    pred = 1 / (1 + np.exp(-z))
-    sse = ((pred - y[None, None, :]) ** 2).sum(-1)
+    saturated points, unlike OLS on logits). Returns (g, b).
+
+    Coarse-to-fine: a coarse pass over the full grid, then the full-resolution
+    grid (0.01 in g, 60 log-spaced values of b) within +-0.15 of the coarse g.
+    Same answer as an exhaustive search on the fine grid unless the SSE surface
+    has two separated minima, at about a tenth of the cost."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    sse = _sse_grid(x, y, G_GRID[::10], B_GRID[::3])
     i, j = np.unravel_index(np.argmin(sse), sse.shape)
-    return G_GRID[j], B_GRID[i]
+    g0 = G_GRID[::10][j]
+    gs = G_GRID[np.abs(G_GRID - g0) <= 0.15 + 1e-9]
+    sse = _sse_grid(x, y, gs, B_GRID)
+    i, j = np.unravel_index(np.argmin(sse), sse.shape)
+    return gs[j], B_GRID[i]
 
 
-def indifference(rows, n_boot=500):
+def indifference(rows, n_boot=500, seed=0):
     """Fit P_s = sigmoid(b * (gap - gap*)) per m on seed-level points.
 
     gap* is the isolated-speed gap at which the network is indifferent between
@@ -101,6 +114,7 @@ def indifference(rows, n_boot=500):
     one before it is preferred (a residual simplicity preference).
     CIs come from resampling seeds within each condition.
     """
+    rng = np.random.default_rng(seed)  # per-call seed: results do not depend on call order
     rows = [r for r in rows if valid(r)]
     if len(rows) < 3:
         return None
@@ -115,25 +129,26 @@ def indifference(rows, n_boot=500):
         return fit_sigmoid(x, np.concatenate(ps_list))
 
     def rgap(a, b):  # bootstrap the speed gap too: resample isolated-run seeds
-        return math.log2(max(np.median(RNG.choice(b, len(b))), 1) / max(np.median(RNG.choice(a, len(a))), 1))
+        return math.log2(max(np.median(rng.choice(b, len(b))), 1) / max(np.median(rng.choice(a, len(a))), 1))
 
     est, slope = fit(seeds, gaps)
-    boots = np.array([fit([RNG.choice(p, size=len(p)) for p in seeds],
-                          [rgap(a, b) for a, b in zip(ts, tc)])[0] for _ in range(n_boot)])
+    bfits = np.array([fit([rng.choice(p, size=len(p)) for p in seeds],
+                          [rgap(a, b) for a, b in zip(ts, tc)]) for _ in range(n_boot)])
+    boots, bslopes = bfits[:, 0], bfits[:, 1]
     lo, hi = np.percentile(boots, [2.5, 97.5])
     # is there data on both sides of P = 0.5? otherwise gap* is an extrapolation
     ps = np.array([r["P_s"] for r in rows])
     bracketed = bool((ps > 0.5).any() and (ps < 0.5).any())
     return dict(gap_star=est, lo=lo, hi=hi, slope=slope, n_cond=len(rows), bracketed=bracketed,
-                gap_range=(float(gaps.min()), float(gaps.max())))
+                gap_range=(float(gaps.min()), float(gaps.max())), boots=boots, bslopes=bslopes)
 
 
 def fmt(x, nd=2):
     return "n/a" if x is None or (isinstance(x, float) and not np.isfinite(x)) else f"{x:.{nd}f}"
 
 
-def main(path):
-    runs = load(path)
+def main(paths):
+    runs = sum((load(p) for p in paths), [])
     os.makedirs(RES, exist_ok=True)
     os.makedirs(FIG, exist_ok=True)
     rows = speed_table(runs)
@@ -160,7 +175,7 @@ def main(path):
     out.append("| exp | optimizer | depth | m | gap* | 95% CI | slope b | valid cells | bracketed | gap range |")
     out.append("|---|---|---|---|---|---|---|---|---|---|")
     ind = {}
-    for exp in ("E1", "E3", "R1"):
+    for exp in ("E1", "E3", "R1", "C3"):
         for opt in ("sgd", "adam"):
             for depth in (1, 3):
                 for m in (2, 3, 5):
@@ -176,7 +191,7 @@ def main(path):
                                f"{fmt(res['gap_range'][0])} to {fmt(res['gap_range'][1])} |")
     out.append("")
 
-    for exp in ("E1", "E3", "R1"):
+    for exp in ("E1", "E3", "R1", "C3"):
         sub = [r for r in rows if r["exp"] == exp]
         if not sub:
             continue
@@ -227,6 +242,39 @@ def main(path):
     fig.tight_layout()
     fig.savefig(os.path.join(FIG, "fig1_preference_vs_speed.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+    # Figure 4: confirmatory depth-3 run (C3), same layout as Figure 1
+    if any(r["exp"] == "C3" for r in rows):
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
+        for ax, opt in zip(axes, ("sgd", "adam")):
+            for m in (2, 3, 5):
+                allsub = [r for r in rows if (r["exp"], r["opt"], r["depth"], r["m"]) == ("C3", opt, 3, m)
+                          and np.isfinite(r["gap"])]
+                sub = [r for r in allsub if valid(r)]
+                bad = [r for r in allsub if not valid(r)]
+                ax.plot([r["gap"] for r in bad], [r["P_s"] for r in bad], "x", color=COL[m], alpha=0.5, ms=5)
+                if not sub:
+                    continue
+                ax.errorbar([r["gap"] for r in sub], [r["P_s"] for r in sub], yerr=[r["P_s_ci"] for r in sub],
+                            fmt="o", color=COL[m], alpha=0.8, ms=5, capsize=2,
+                            label={2: "m=2 (both linear, control)", 3: "m=3 slabs", 5: "m=5 slabs"}[m])
+                res = ind.get(("C3", opt, 3, m))
+                if res:
+                    xs = np.linspace(min(r["gap"] for r in sub) - 0.3, max(r["gap"] for r in sub) + 0.3, 100)
+                    ax.plot(xs, 1 / (1 + np.exp(-res["slope"] * (xs - res["gap_star"]))), "-", color=COL[m], lw=1, alpha=0.6)
+                    ax.axvline(res["gap_star"], color=COL[m], lw=0.8, ls="--", alpha=0.6)
+            ax.axhline(0.5, color="k", lw=0.6, ls=":")
+            ax.axvline(0, color="k", lw=0.6, ls=":")
+            ax.set_title(f"C3 (confirmatory), 3 hidden layers, {opt.upper()}")
+            ax.set_xlabel("isolated speed gap  log2(T_complex / T_simple)\n<- complex learned faster      complex learned slower ->")
+        axes[0].set_ylabel("P_s: share of conflict points decided by simple feature")
+        axes[0].legend(fontsize=8, loc="lower right")
+        fig.text(0.5, -0.04, "Fresh seeds 200-209, grid fixed before running. Dashed lines: fitted indifference points gap*. "
+                 "Error bars: 95% CI over 10 seeds. x: excluded cells.", ha="center", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(os.path.join(FIG, "fig4_confirmatory_depth3.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
     # ---------- E2: predictive strength ----------
     e2 = [r for r in runs if r["exp"] == "E2"]
@@ -290,4 +338,5 @@ def main(path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(RES, "runs.jsonl"))
+    main(sys.argv[1:] or [os.path.join(RES, p) for p in ("runs.jsonl", "runs_confirm.jsonl")
+                          if os.path.exists(os.path.join(RES, p))])
