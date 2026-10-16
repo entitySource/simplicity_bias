@@ -20,8 +20,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get("SB_OUT", os.path.join(HERE, "..", "results", "runs.jsonl"))
 
 
-def jobs(seeds: int, only: set[str]):
+# Confirmatory depth-3 grid (C3). Fixed on 2026-10-15 from the pilot E3 tables,
+# before any C3 run, to place cells on both sides of P_s = 0.5 for every m.
+# See ../preregistration.md. Seeds 200-209: no pilot seed is reused (seed 100 was used once to time the code).
+C3_CELLS = {
+    2: [(0.5, 1), (0.7, 1), (1, 1), (1, 1.4), (1, 2), (1, 0.7)],
+    3: [(1, 1.5), (1, 2), (1, 3), (1, 4), (1, 6), (1, 8)],
+    5: [(1, 8), (1, 16), (0.5, 8), (0.4, 8), (0.3, 8), (0.5, 16)],
+}
+
+
+def jobs(seeds: int, only: set[str], seed0: int = 0):
     js = []
+    if "C3" in only:
+        for opt, m, mode, s in itertools.product(["sgd", "adam"], [2, 3, 5], ["only_s", "only_c", "joint"],
+                                                 range(seed0, seed0 + seeds)):
+            for a_s, a_c in C3_CELLS[m]:
+                js.append(("C3", dict(m=m, alpha_s=a_s, alpha_c=a_c), dict(opt=opt, depth=3), mode, s))
     # E1: decouple complexity (m) from learning speed (relative coordinate scale)
     if "E1" in only:
         for opt, m, a_s, a_c, mode, s in itertools.product(
@@ -68,11 +83,13 @@ def run(j):
     torch.set_num_threads(1)
     exp, dkw, tkw, mode, seed = j
     r = train(DataCfg(**dkw), TrainCfg(**tkw), seed, mode)
-    if mode != "joint":
+    if mode != "joint" and exp != "C3":
         r.pop("curve")
     else:  # keep the curve but thin it
         c = r["curve"]
-        keep = [i for i, st in enumerate(c["step"]) if st < 100 and st % 5 == 0 or st % 50 == 0]
+        # C3 keeps every evaluated step below 500 (needed for the T90/T75 robustness check)
+        keep = [i for i, st in enumerate(c["step"])
+                if (exp == "C3" and st < 500) or (st < 100 and st % 5 == 0) or st % 50 == 0]
         r["curve"] = {k: [v[i] for i in keep] for k, v in c.items()}
     return {"key": key(j), "exp": exp, "data": dkw, "train": tkw, "mode": mode, "seed": seed, **r}
 
@@ -82,12 +99,13 @@ def main():
     ap.add_argument("--procs", type=int, default=4)
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--only", default="E1,E2,E3,E3b,E3c,R1")
+    ap.add_argument("--seed0", type=int, default=0, help="first seed (C3 uses 200)")
     a = ap.parse_args()
     done = set()
     if os.path.exists(OUT):
         with open(OUT) as f:
             done = {json.loads(l)["key"] for l in f if l.strip()}
-    todo = [j for j in jobs(a.seeds, set(a.only.split(","))) if key(j) not in done]
+    todo = [j for j in jobs(a.seeds, set(a.only.split(",")), a.seed0) if key(j) not in done]
     print(f"{len(todo)} runs to do ({len(done)} already done)", flush=True)
     with Pool(a.procs) as pool, open(OUT, "a") as f:
         for i, r in enumerate(pool.imap_unordered(run, todo, chunksize=2)):
